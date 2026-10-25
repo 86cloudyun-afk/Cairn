@@ -1,0 +1,20 @@
+# Example: install this checkout at /opt/cairn, or adjust all paths consistently.
+[Unit]
+Description=Cairn dispatcher ordered after the network guard
+Requires=docker.service cairn-network.service
+After=docker.service cairn-network.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cairn
+ExecStartPre=/usr/bin/docker compose -f docker-compose.yaml -f deploy/network/compose.override.yaml up -d --wait cairn-server
+ExecStart=/usr/bin/docker compose -f docker-compose.yaml -f deploy/network/compose.override.yaml up --no-deps cairn-dispatcher
+ExecStop=/usr/bin/docker compose -f docker-compose.yaml -f deploy/network/compose.override.yaml stop cairn-dispatcher
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

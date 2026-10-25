@@ -4,9 +4,15 @@ import logging
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
-from cairn.dispatcher.contracts import parse_json_output, validate_reason_payload
+from cairn.dispatcher.contracts import (
+    parse_json_output,
+    validate_reason_payload,
+    validate_reason_plan,
+    validate_reason_references,
+)
 from cairn.dispatcher.prompting import (
     format_fact_ids,
+    format_json_block,
     format_open_intents,
     load_prompt,
     render_prompt,
@@ -86,17 +92,19 @@ def run_reason_task(
                 "from": intent.from_,
                 "description": intent.description,
                 "worker": intent.worker,
+                "depends_on": intent.depends_on,
+                "priority": intent.priority,
             }
             for intent in project.intents
             if intent.to is None
         ]
-        allowed_fact_ids = [fact.id for fact in project.facts if fact.id != "goal"]
+        allowed_facts = [fact for fact in project.facts if fact.id != "goal"]
         LOG.debug(
             "reason context prepared project=%s worker=%s facts=%s allowed_fact_ids=%s hints=%s open_intents=%s",
             project.project.id,
             worker.name,
             len(project.facts),
-            len(allowed_fact_ids),
+            len(allowed_facts),
             len(project.hints),
             len(open_intents),
         )
@@ -109,8 +117,10 @@ def run_reason_task(
                     export_yaml.strip(),
                     phase="reason_execute",
                 ),
-                "fact_ids": format_fact_ids(allowed_fact_ids),
+                "fact_ids": format_fact_ids(allowed_facts),
+                "fact_ids_json": format_json_block([fact.id for fact in allowed_facts]),
                 "open_intents": format_open_intents(open_intents),
+                "plan": format_json_block(project.project.plan.model_dump()),
                 "max_intents": str(config.tasks.reason.max_intents),
             },
         )
@@ -179,6 +189,11 @@ def run_reason_task(
             kind, data = validate_reason_payload(
                 payload, open_intents_empty=not open_intents, max_intents=config.tasks.reason.max_intents,
             )
+            plan = validate_reason_plan(payload)
+            validate_reason_references(
+                kind, data, fact_ids={fact.id for fact in project.facts},
+                intent_ids={intent.id for intent in project.intents}, plan=plan,
+            )
         except Exception as exc:
             LOG.warning(
                 "reason parse failed project=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -201,6 +216,20 @@ def run_reason_task(
                 preview(result.stdout),
             )
             return "rejected"
+        if plan is not None:
+            response = client.update_plan(project.project.id, plan, worker.name)
+            if response.status_code == 403:
+                LOG.info("project became inactive during reason plan update project=%s worker=%s", project.project.id, worker.name)
+                return "success"
+            if not response.ok:
+                LOG.warning(
+                    "reason plan write failed project=%s worker=%s status=%s body=%s",
+                    project.project.id,
+                    worker.name,
+                    response.status_code,
+                    response.text,
+                )
+                return "failed"
         if kind == "complete":
             response = client.complete(project.project.id, data["from"], data["description"], worker.name)
             if response.status_code == 403:
@@ -227,7 +256,20 @@ def run_reason_task(
         if kind == "intents":
             created = 0
             for intent_data in data:
-                response = client.create_intent(project.project.id, intent_data["from"], intent_data["description"], worker.name)
+                metadata = {}
+                if intent_data.get("depends_on"):
+                    metadata["depends_on"] = intent_data["depends_on"]
+                if intent_data.get("priority", 0) != 0:
+                    metadata["priority"] = intent_data["priority"]
+                if intent_data.get("session_key") is not None:
+                    metadata["session_key"] = intent_data["session_key"]
+                response = client.create_intent(
+                    project.project.id,
+                    intent_data["from"],
+                    intent_data["description"],
+                    worker.name,
+                    **metadata,
+                )
                 if response.status_code == 403:
                     LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
                     return "success"

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, JsonValue, ValidationInfo, field_validator, model_validator
 
 
 class Settings(BaseModel):
@@ -10,9 +11,75 @@ class Settings(BaseModel):
     reason_timeout: int = Field(ge=5)
 
 
-class Fact(BaseModel):
-    id: str
+FactKind = Literal["finding", "credential", "endpoint", "negative", "other"]
+
+
+class FactContent(BaseModel):
     description: str
+    kind: FactKind = "other"
+    summary: str = ""
+    ip: str | None = None
+    port: int | None = Field(default=None, ge=0, le=65535, strict=True)
+    url: str | None = None
+    confidence: int | None = Field(default=None, ge=0, le=100, strict=True)
+
+    @model_validator(mode="after")
+    def populate_summary(self):
+        self.summary = " ".join((self.summary or self.description).split())[:120]
+        return self
+
+
+class Fact(FactContent):
+    id: str
+
+
+class ExecutionPlan(BaseModel):
+    current_stage: int = Field(default=0, ge=0, strict=True)
+    stages: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_current_stage(self):
+        if self.current_stage > len(self.stages):
+            raise ValueError("current_stage must not exceed the number of stages")
+        return self
+
+
+class CreateArtifactRequest(BaseModel):
+    fact_id: str | None = None
+    kind: Literal["account", "session", "token", "file", "endpoint"]
+    name: str
+    value: JsonValue | None = None
+    file_path: str | None = None
+    expires_at: AwareDatetime | None = None
+
+    @field_validator("name", "fact_id", "file_path")
+    @classmethod
+    def validate_artifact_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expiry(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(timezone.utc) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_file_path(self):
+        if self.kind == "file" and self.file_path is None:
+            raise ValueError("file artifacts require file_path")
+        return self
+
+
+class Artifact(CreateArtifactRequest):
+    id: str
+    project_id: str
+    created_at: AwareDatetime
 
 
 class Intent(BaseModel):
@@ -25,6 +92,9 @@ class Intent(BaseModel):
     last_heartbeat_at: str | None = None
     created_at: str
     concluded_at: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    priority: int = Field(default=0, strict=True)
+    session_key: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -50,6 +120,7 @@ class ProjectMeta(BaseModel):
     bootstrap_enabled: bool
     created_at: str
     reason: ProjectReason | None = None
+    plan: ExecutionPlan = Field(default_factory=ExecutionPlan)
 
 
 class ProjectSummary(ProjectMeta):
@@ -65,6 +136,7 @@ class ProjectDetail(BaseModel):
     facts: list[Fact]
     intents: list[Intent]
     hints: list[Hint]
+    artifacts: list[Artifact] = Field(default_factory=list)
 
 
 class CreateHintInline(BaseModel):
@@ -89,11 +161,11 @@ class CreateProjectRequest(BaseModel):
 
     @field_validator("title", "origin", "goal")
     @classmethod
-    def validate_non_empty_text(cls, value: str) -> str:
+    def validate_non_empty_text(cls, value: str, info: ValidationInfo) -> str:
         text = value.strip()
         if not text:
             raise ValueError("must not be empty")
-        return text
+        return text if info.field_name == "title" else value
 
 
 class CreateHintRequest(BaseModel):
@@ -114,10 +186,13 @@ class CreateIntentRequest(BaseModel):
     description: str
     creator: str
     worker: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    priority: int = Field(default=0, strict=True)
+    session_key: str | None = None
 
     model_config = {"populate_by_name": True}
 
-    @field_validator("description", "creator", "worker")
+    @field_validator("description", "creator", "worker", "session_key")
     @classmethod
     def validate_non_empty_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -127,7 +202,7 @@ class CreateIntentRequest(BaseModel):
             raise ValueError("must not be empty")
         return text
 
-    @field_validator("from_")
+    @field_validator("from_", "depends_on")
     @classmethod
     def validate_fact_ids(cls, value: list[str]) -> list[str]:
         cleaned = []
@@ -164,17 +239,25 @@ class ReasonClaimRequest(BaseModel):
         return text
 
 
-class ConcludeRequest(BaseModel):
+class ConcludeRequest(FactContent):
     worker: str
-    description: str
+    artifact_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("artifact_ids")
+    @classmethod
+    def validate_artifact_ids(cls, value: list[str]) -> list[str]:
+        cleaned = [artifact_id.strip() for artifact_id in value]
+        if any(not artifact_id for artifact_id in cleaned):
+            raise ValueError("artifact ids must not be empty")
+        return cleaned
 
     @field_validator("worker", "description")
     @classmethod
-    def validate_non_empty_text(cls, value: str) -> str:
+    def validate_non_empty_text(cls, value: str, info: ValidationInfo) -> str:
         text = value.strip()
         if not text:
             raise ValueError("must not be empty")
-        return text
+        return value if info.field_name == "description" else text
 
 
 class CompleteRequest(BaseModel):
@@ -213,6 +296,10 @@ class UpdateProjectStatusRequest(BaseModel):
     status: Literal["active", "stopped"]
 
 
+class UpdateProjectPlanRequest(HeartbeatRequest):
+    plan: ExecutionPlan
+
+
 class UpdateProjectTitleRequest(BaseModel):
     title: str
 
@@ -231,11 +318,11 @@ class ReopenRequest(BaseModel):
 
     @field_validator("description", "creator")
     @classmethod
-    def validate_non_empty_text(cls, value: str) -> str:
+    def validate_non_empty_text(cls, value: str, info: ValidationInfo) -> str:
         text = value.strip()
         if not text:
             raise ValueError("must not be empty")
-        return text
+        return value if info.field_name == "description" else text
 
 
 class ReopenResponse(BaseModel):

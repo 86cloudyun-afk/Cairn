@@ -92,6 +92,14 @@ def test_local_process_kill_terminates_child_process_group(tmp_path: Path) -> No
             os.kill(child_pid, 0)
         except ProcessLookupError:
             break
+        try:
+            status_lines = Path(f"/proc/{child_pid}/status").read_text().splitlines()
+        except (FileNotFoundError, PermissionError):
+            status_lines = []
+        # Container PID 1 may leave exited orphans unreaped. A zombie has
+        # terminated even though kill(pid, 0) still reports that its PID exists.
+        if any(line.startswith("State:") and line.split()[1] == "Z" for line in status_lines):
+            break
         time.sleep(0.1)
     else:
         raise AssertionError(f"child process {child_pid} survived the group kill")

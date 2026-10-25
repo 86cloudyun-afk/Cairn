@@ -1,11 +1,12 @@
-from fastapi import APIRouter
+import json
+
+from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
     ConcludeRequest,
     ConcludeResponse,
     CreateIntentRequest,
-    Fact,
     HeartbeatRequest,
     Intent,
 )
@@ -14,11 +15,13 @@ from cairn.server.services import (
     get_claimable_open_intent_or_404,
     get_releasable_open_intent_or_404,
     intent_to_model,
+    insert_fact,
     next_fact_id,
     next_intent_id,
     utcnow,
     validate_facts_exist,
     validate_intent_creator_worker,
+    validate_intent_dependencies,
     validate_goal_not_in_sources,
 )
 
@@ -40,8 +43,11 @@ def create_intent(project_id: str, body: CreateIntentRequest):
         now = utcnow()
         iid = next_intent_id(conn, project_id)
         claimed = body.worker is not None
+        validate_intent_dependencies(
+            conn, project_id, body.depends_on, intent_id=iid, require_completed=claimed,
+        )
         conn.execute(
-            "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at, depends_on, priority, session_key) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (
                 iid,
                 project_id,
@@ -50,6 +56,9 @@ def create_intent(project_id: str, body: CreateIntentRequest):
                 body.worker,
                 now if claimed else None,
                 now,
+                json.dumps(body.depends_on),
+                body.priority,
+                body.session_key,
             ),
         )
         for fid in body.from_:
@@ -68,6 +77,9 @@ def create_intent(project_id: str, body: CreateIntentRequest):
             last_heartbeat_at=now if claimed else None,
             created_at=now,
             concluded_at=None,
+            depends_on=body.depends_on,
+            priority=body.priority,
+            session_key=body.session_key,
         )
 
 
@@ -124,16 +136,27 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         check_project_active(conn, project_id)
         get_claimable_open_intent_or_404(conn, project_id, intent_id, body.worker)
 
+        for artifact_id in body.artifact_ids:
+            artifact = conn.execute(
+                "SELECT fact_id FROM artifacts WHERE id = ? AND project_id = ?",
+                (artifact_id, project_id),
+            ).fetchone()
+            if artifact is None:
+                raise HTTPException(404, f"Artifact {artifact_id} not found")
+            if artifact["fact_id"] is not None:
+                raise HTTPException(409, f"Artifact {artifact_id} is already linked to a fact")
+
         now = utcnow()
         fid = next_fact_id(conn, project_id)
 
-        conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            (fid, project_id, body.description),
-        )
+        fact = insert_fact(conn, project_id, fid, body)
         conn.execute(
             "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? WHERE id = ? AND project_id = ?",
             (fid, body.worker, now, now, intent_id, project_id),
+        )
+        conn.executemany(
+            "UPDATE artifacts SET fact_id = ? WHERE id = ? AND project_id = ?",
+            [(fid, artifact_id, project_id) for artifact_id in body.artifact_ids],
         )
 
         updated = conn.execute(
@@ -142,6 +165,6 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         ).fetchone()
 
         return ConcludeResponse(
-            fact=Fact(id=fid, description=body.description),
+            fact=fact,
             intent=intent_to_model(conn, updated, project_id),
         )

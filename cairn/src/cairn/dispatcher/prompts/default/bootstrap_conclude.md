@@ -16,6 +16,12 @@ Normal return example:
 {"accepted": true, "data": {"fact": {"description": "..."}}}
 ```
 
+Facts may include structured fields:
+```json
+{"accepted": true, "data": {"fact": {"description": "Confirmed result and supporting evidence", "kind": "finding", "summary": "Concise result", "confidence": 95}}}
+```
+Optional fact fields are `kind` (`finding`, `credential`, `endpoint`, `negative`, or `other`), `summary`, `ip`, `port` (integer 0–65535), `url`, and `confidence` (integer 0–100).
+
 ## Rules
 - Stop immediately and produce the JSON now. Do not continue the task.
 - Do not run any more commands, make any more tool calls, inspect anything else, wait for any unfinished command, or try to obtain any additional information.
@@ -23,6 +29,8 @@ Normal return example:
 - This JSON summary is your final output for this phase. After outputting it, stop.
 - Do not output `complete` in this phase. Even if Goal is not achieved or you want to explain status, put that information into `fact.description` only.
 - `fact.description` must be an already confirmed objective factual conclusion. Do not output plans, guesses, or explanatory filler.
+- Use `kind: "negative"` for a confirmed failed attempt and record the affected `ip` and `port` when known. A negative result does not prove that a stage succeeded. Keep `summary` to a concise line, and include only confirmed metadata.
+- Describe progress against the current stage and cite the evidence already obtained. Preserve unresolved work honestly; the reasoning phase will update the execution plan.
 - Do not put long data blobs in `fact.description`. Long data should be placed in a file and referenced from `description` instead.
 
 # Context
@@ -39,4 +47,9 @@ Normal return example:
 ## Hints
 ```
 {hints}
+```
+
+## Current execution plan
+```json
+{plan}
 ```
