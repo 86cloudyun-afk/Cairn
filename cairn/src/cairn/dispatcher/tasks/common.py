@@ -70,6 +70,23 @@ def write_graph_snapshot_reference(
     )
 
 
+def write_artifacts_snapshot_reference(
+    container_manager: ContainerManager,
+    container_name: str,
+    artifacts_json: str,
+    *,
+    phase: str,
+) -> str:
+    path = f"{GRAPH_SNAPSHOT_ROOT}/{phase}-{uuid.uuid4().hex[:12]}/artifacts.json"
+    container_manager.write_text_file(container_name, path, artifacts_json, private=True)
+    return (
+        "The unexpired artifact inventory is stored in this JSON file in the current workspace:\n\n"
+        f"{path}\n\n"
+        "Read the complete inventory before taking actions. Prefer reusing its existing accounts, "
+        "cookies, tokens, endpoints and scripts; check expiry and usability before creating replacements."
+    )
+
+
 def run_worker_process(
     container_manager: ContainerManager,
     container_name: str,

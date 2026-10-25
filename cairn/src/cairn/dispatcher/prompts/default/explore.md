@@ -31,9 +31,7 @@ Fact kinds: finding/credential/endpoint/negative/other. Optional confidence is a
 
 # Context
 ## Unexpired Artifacts
-```json
 {artifacts}
-```
 
 ## Graph
 ```

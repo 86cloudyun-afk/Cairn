@@ -104,7 +104,7 @@ class FakeContainerManager:
     def ensure_running(self, project_id: str) -> str:
         return f"container-{project_id}"
 
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+    def write_text_file(self, container_name: str, path: str, content: str, *, private: bool = False) -> None:
         self.writes.append((container_name, path, content))
 
 

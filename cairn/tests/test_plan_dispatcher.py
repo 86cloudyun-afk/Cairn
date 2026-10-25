@@ -307,6 +307,73 @@ def test_all_blocked_intents_trigger_reason_and_only_success_suppresses_repeat(o
         assert loop._reason_trigger(project) == "blocked_dependencies"
 
 
+@pytest.mark.parametrize("new_context", ["fact", "hint"])
+def test_initial_plan_only_blockers_wait_for_new_context_after_success(monkeypatch, new_context):
+    project = make_project()
+    project.project.bootstrap_enabled = False
+    project.facts = project.facts[:2]
+    loop = _dispatch_loop(project)
+    loop.reason_checkpoints.clear()
+    loop.client.claim_reason = lambda *_args: ApiResult(200, {})
+    future = Future()
+    loop.executor = type("Executor", (), {"submit": lambda *_args: future})()
+    client = PlanClient(project)
+    plan = _plan(0, blockers=["Waiting for the target address"])
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    outcome, _ = _run_reason(monkeypatch, project, client, {"plan": plan})
+    assert outcome == "success"
+    assert client.events == [("plan", "proj_001", plan, "test-worker")]
+    assert len(project.facts) == 2 and project.intents == []
+    future.set_result(outcome)
+    loop._reap_futures()
+
+    assert not loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert not loop._try_dispatch_project(_summary("proj_001", "active"))
+    if new_context == "fact":
+        project.facts.append(Fact(id="f001", description="Target address confirmed"))
+    else:
+        project.hints.append(project.hints[0].model_copy(update={"id": "h002", "content": "Target address supplied"}))
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+
+
+def test_initial_failed_plan_only_reasoning_remains_retryable(monkeypatch):
+    project = make_project()
+    project.project.bootstrap_enabled = False
+    project.facts = project.facts[:2]
+    loop = _dispatch_loop(project)
+    loop.reason_checkpoints.clear()
+    loop.client.claim_reason = lambda *_args: ApiResult(200, {})
+    future = Future()
+    loop.executor = type("Executor", (), {"submit": lambda *_args: future})()
+    client = PlanClient(project)
+    client.plan_status = 500
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    outcome, _ = _run_reason(monkeypatch, project, client, {"plan": _plan(0, blockers=["Waiting for the target address"])})
+    assert outcome == "failed"
+    future.set_result(outcome)
+    loop._reap_futures()
+
+    assert "proj_001" not in loop.reason_checkpoints
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+
+
+def test_initial_bootstrap_still_dispatches_with_an_existing_checkpoint():
+    intent = _unclaimed("i001")
+    intent.description = "bootstrap"
+    intent.creator = "dispatcher.bootstrap"
+    intent.from_ = ["origin"]
+    project = make_project(intents=[intent])
+    project.facts = project.facts[:2]
+    loop = _dispatch_loop(project)
+    chosen = []
+    loop._dispatch_bootstrap = lambda _project, selected: chosen.append(selected.id) or True
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert chosen == ["i001"]
+
+
 def test_new_evidence_retriggers_reason_while_dependencies_remain_blocked():
     project = make_project(intents=[_unclaimed("i001", dependencies=["missing"])])
     loop = _dispatch_loop(project)
