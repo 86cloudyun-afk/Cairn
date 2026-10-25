@@ -202,6 +202,12 @@ Run the fast regression suite without Docker or live model endpoints:
 uv run --project cairn --group dev pytest
 ```
 
+## Workflow state and deployment
+
+- [Execution plans, reusable artifacts, structured fact summaries, and SQLite upgrades](docs/workflow-state.md)
+- [Container request wrapper, proxy pool checks, and local HTTP verification](container/README.md)
+- [Linux Docker bridge isolation, nftables policy, systemd setup, and verification](deploy/network/README.md)
+
 ## Disclaimer
 
 Cairn is a general-purpose problem-solving engine. Although it supports penetration testing, CTF solving, security assessment, and vulnerability research workflows, it is intended to be used only in environments where you have explicit authorization to operate.

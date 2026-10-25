@@ -1,0 +1,5 @@
+# Use with the repository docker-compose.yaml, with dispatcher startup managed by
+# cairn-dispatcher.service so it cannot start before the network guard at boot.
+services:
+  cairn-dispatcher:
+    restart: "no"

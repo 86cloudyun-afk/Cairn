@@ -8,8 +8,9 @@ from cairn.dispatcher.contracts import (
     parse_json_output,
     validate_bootstrap_conclude_payload,
     validate_bootstrap_execute_payload,
+    validate_bootstrap_fact,
 )
-from cairn.dispatcher.prompting import format_hints, load_prompt, render_prompt
+from cairn.dispatcher.prompting import format_hints, format_json_block, load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
@@ -22,7 +23,6 @@ from cairn.dispatcher.tasks.common import (
     preview,
     run_worker_process,
     task_healthcheck_enabled,
-    write_conclude_result,
     write_conclude_result_with_fact_id,
 )
 from cairn.dispatcher.workers.registry import get_driver
@@ -138,6 +138,7 @@ def run_bootstrap_task(
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
                 kind, data = validate_bootstrap_execute_payload(payload)
+                fact_fields = validate_bootstrap_fact(payload)
             except Exception as exc:
                 LOG.warning(
                     "bootstrap parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -181,10 +182,12 @@ def run_bootstrap_task(
                 intent.id,
                 worker.name,
                 data["fact_description"],
-                data["complete_description"],
+                data.get("complete_description", ""),
                 source="bootstrap",
                 phase_ms=execute_ms,
                 total_ms=int((time.perf_counter() - task_started) * 1000),
+                fact_fields=fact_fields,
+                allow_complete=kind == "complete" and len(project.project.plan.stages) <= 1,
             )
         if did_timeout(first):
             LOG.warning(
@@ -346,6 +349,7 @@ def _try_conclude_fallback(
                 preview(str(conclude_data.get("complete"))),
             )
         kind, fact_description = validate_bootstrap_conclude_payload(payload)
+        fact_fields = validate_bootstrap_fact(payload)
     except Exception as exc:
         LOG.warning(
             "bootstrap conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -370,7 +374,7 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
         return "rejected"
-    return write_conclude_result(
+    return write_conclude_result_with_fact_id(
         client,
         project.project.id,
         intent.id,
@@ -378,7 +382,8 @@ def _try_conclude_fallback(
         fact_description,
         source="bootstrap_conclude",
         phase_ms=conclude_ms,
-    )
+        fact_fields=fact_fields,
+    ).status
 
 
 def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
@@ -396,6 +401,7 @@ def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
         "origin": facts.get("origin", ""),
         "goal": facts.get("goal", ""),
         "hints": format_hints(hints),
+        "plan": format_json_block(project.project.plan.model_dump()),
     }
 
 
@@ -410,6 +416,8 @@ def _write_bootstrap_complete_result(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    fact_fields: dict | None = None,
+    allow_complete: bool = True,
 ) -> str:
     conclude = write_conclude_result_with_fact_id(
         client,
@@ -420,9 +428,20 @@ def _write_bootstrap_complete_result(
         source=source,
         phase_ms=phase_ms,
         total_ms=total_ms,
+        fact_fields=fact_fields,
     )
     if conclude.status != "success":
         return "failed"
+    if not allow_complete:
+        LOG.info(
+            "bootstrap progress saved for staged reasoning project=%s intent=%s worker=%s source=%s fact_id=%s",
+            project_id,
+            intent_id,
+            worker_name,
+            source,
+            conclude.fact_id,
+        )
+        return "success"
     if conclude.fact_id is None:
         LOG.warning(
             "bootstrap complete deferred because conclude response omitted fact id project=%s intent=%s worker=%s source=%s",

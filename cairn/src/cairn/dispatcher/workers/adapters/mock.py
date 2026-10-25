@@ -125,6 +125,9 @@ else:
 class MockDriver(SeedSessionDriver):
     type_name = "mock"
 
+    def supports_resume(self) -> bool:
+        return False
+
     def local_binary(self) -> str | None:
         return "python3"
 

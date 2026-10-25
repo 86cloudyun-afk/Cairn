@@ -1,0 +1,19 @@
+[Unit]
+Description=Cairn task bridge network guard
+Requires=docker.service
+Wants=network-online.target
+After=network-online.target docker.service nftables.service
+Before=cairn-dispatcher.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/cairn-network/enable.sh
+ExecReload=/usr/local/lib/cairn-network/enable.sh
+# Deliberately no ExecStop: stopping this service keeps its firewall guard active.
+# Remove/detach task containers, then explicitly run disable.sh to tear it down.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

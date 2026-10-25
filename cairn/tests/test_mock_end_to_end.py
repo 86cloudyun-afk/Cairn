@@ -161,7 +161,7 @@ class LocalContainerManager:
         assert kill_after_seconds == 5
         return LocalProcess(command, env)
 
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+    def write_text_file(self, container_name: str, path: str, content: str, *, private: bool = False) -> None:
         self.writes.append((container_name, path, content))
 
     def needs_completed_cleanup(self, _project_id: str) -> bool:

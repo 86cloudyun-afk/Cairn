@@ -65,8 +65,25 @@ def write_graph_snapshot_reference(
     return (
         "The graph YAML snapshot is stored in this file inside the current container:\n\n"
         f"{path}\n\n"
-        "Before using the graph, read the entire file and treat its contents as the YAML snapshot "
-        "for this Graph section."
+        "Use the injected summaries first. Read relevant full fact descriptions from this YAML file "
+        "only when more detail is needed."
+    )
+
+
+def write_artifacts_snapshot_reference(
+    container_manager: ContainerManager,
+    container_name: str,
+    artifacts_json: str,
+    *,
+    phase: str,
+) -> str:
+    path = f"{GRAPH_SNAPSHOT_ROOT}/{phase}-{uuid.uuid4().hex[:12]}/artifacts.json"
+    container_manager.write_text_file(container_name, path, artifacts_json, private=True)
+    return (
+        "The unexpired artifact inventory is stored in this JSON file in the current workspace:\n\n"
+        f"{path}\n\n"
+        "Read the complete inventory before taking actions. Prefer reusing its existing accounts, "
+        "cookies, tokens, endpoints and scripts; check expiry and usability before creating replacements."
     )
 
 
@@ -175,8 +192,9 @@ def write_conclude_result_with_fact_id(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    fact_fields: dict | None = None,
 ) -> ConcludeWriteResult:
-    response = client.conclude(project_id, intent_id, worker_name, description)
+    response = client.conclude(project_id, intent_id, worker_name, description, **(fact_fields or {}))
     if response.ok:
         fact_id: str | None = None
         if isinstance(response.data, dict):

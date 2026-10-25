@@ -100,9 +100,10 @@ def test_explore_early_plain_text_exit_uses_conclude_fallback(monkeypatch) -> No
 
     assert outcome == "success"
     assert client.concluded == [("proj_001", "i001", "test-worker", "confirmed fact")]
-    assert len(containers.writes) == 2
-    assert "/explore_execute-" in containers.writes[0][1]
-    assert "/explore_conclude-" in containers.writes[1][1]
+    graph_writes = [entry for entry in containers.writes if entry[1].endswith("/graph.yaml")]
+    assert len(graph_writes) == 2
+    assert "/explore_execute-" in graph_writes[0][1]
+    assert "/explore_conclude-" in graph_writes[1][1]
     assert len(driver.execute_prompts) == 1
     assert len(driver.conclude_prompts) == 1
     assert lease.started and lease.stopped

@@ -1,0 +1,4 @@
+# One authorized public IPv4 address or CIDR per line. Empty means no targets.
+# Inline comments are supported. Hostnames, ports, and IPv6 are rejected.
+# Example syntax (replace with your own authorized target):
+# 93.184.216.34
