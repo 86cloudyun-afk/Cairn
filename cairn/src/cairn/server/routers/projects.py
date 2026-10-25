@@ -4,7 +4,9 @@ from cairn.server.db import get_conn
 from cairn.server.models import (
     CompleteRequest,
     CreateProjectRequest,
+    ExecutionPlan,
     Fact,
+    FactContent,
     Hint,
     HeartbeatRequest,
     Intent,
@@ -16,9 +18,11 @@ from cairn.server.models import (
     ReasonClaimRequest,
     UpdateProjectTitleRequest,
     UpdateProjectStatusRequest,
+    UpdateProjectPlanRequest,
 )
 from cairn.server.services import (
     build_intents,
+    build_artifacts,
     check_project_completed,
     check_project_active,
     clear_project_reason,
@@ -27,12 +31,12 @@ from cairn.server.services import (
     get_completion_intent_or_409,
     get_project_or_404,
     intent_to_model,
+    insert_fact,
     next_fact_id,
     next_hint_id,
     next_intent_id,
     next_project_id,
     project_meta_from_row,
-    project_reason_from_row,
     utcnow,
     validate_facts_exist,
     validate_goal_not_in_sources,
@@ -58,12 +62,7 @@ def list_projects():
         """).fetchall()
         return [
             ProjectSummary(
-                id=row["id"],
-                title=row["title"],
-                status=row["status"],
-                bootstrap_enabled=bool(row["bootstrap_enabled"]),
-                created_at=row["created_at"],
-                reason=project_reason_from_row(row),
+                **project_meta_from_row(row).model_dump(),
                 fact_count=row["fact_count"],
                 intent_count=row["intent_count"],
                 working_intent_count=row["working_intent_count"],
@@ -79,19 +78,15 @@ def create_project(body: CreateProjectRequest):
     with get_conn() as conn:
         pid = next_project_id(conn)
         now = utcnow()
+        stages = [line.strip() for line in body.goal.splitlines() if line.strip()]
+        plan = ExecutionPlan(stages=stages if len(stages) > 1 else [])
 
         conn.execute(
-            "INSERT INTO projects (id, title, status, bootstrap_enabled, created_at) VALUES (?, ?, 'active', ?, ?)",
-            (pid, body.title, body.bootstrap_enabled, now),
+            "INSERT INTO projects (id, title, status, bootstrap_enabled, created_at, plan) VALUES (?, ?, 'active', ?, ?, ?)",
+            (pid, body.title, body.bootstrap_enabled, now, plan.model_dump_json()),
         )
-        conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            ("origin", pid, body.origin),
-        )
-        conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            ("goal", pid, body.goal),
-        )
+        origin = insert_fact(conn, pid, "origin", FactContent(description=body.origin))
+        goal = insert_fact(conn, pid, "goal", FactContent(description=body.goal))
 
         hints = []
         if body.hints:
@@ -111,10 +106,11 @@ def create_project(body: CreateProjectRequest):
                 bootstrap_enabled=body.bootstrap_enabled,
                 created_at=now,
                 reason=None,
+                plan=plan,
             ),
             facts=[
-                Fact(id="origin", description=body.origin),
-                Fact(id="goal", description=body.goal),
+                origin,
+                goal,
             ],
             intents=[],
             hints=hints,
@@ -141,6 +137,7 @@ def get_project(project_id: str):
             facts=[Fact(**dict(f)) for f in facts],
             intents=build_intents(conn, project_id),
             hints=[Hint(**dict(h)) for h in hints],
+            artifacts=build_artifacts(conn, project_id),
         )
 
 
@@ -185,6 +182,24 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
             )
             clear_project_reason(conn, project_id)
         updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return project_meta_from_row(updated)
+
+
+@router.put("/projects/{project_id}/plan", response_model=ProjectMeta)
+def update_project_plan(project_id: str, body: UpdateProjectPlanRequest):
+    with get_conn() as conn:
+        check_project_active(conn, project_id)
+        expire_reason_leases(conn, project_id)
+        row = get_project_or_404(conn, project_id)
+        if row["reason_worker"] != body.worker:
+            raise HTTPException(409, "Plan updates require the current reason lease owner")
+        current = ExecutionPlan.model_validate_json(row["plan"])
+        if current.stages and body.plan.stages != current.stages:
+            raise HTTPException(409, "Plan stages cannot be changed or reordered")
+        if body.plan.current_stage < current.current_stage:
+            raise HTTPException(409, "Plan stage cannot regress")
+        conn.execute("UPDATE projects SET plan = ? WHERE id = ?", (body.plan.model_dump_json(), project_id))
+        updated = get_project_or_404(conn, project_id)
         return project_meta_from_row(updated)
 
 
@@ -261,6 +276,9 @@ def complete_project(project_id: str, body: CompleteRequest):
         expire_reason_leases(conn, project_id)
         validate_facts_exist(conn, project_id, body.from_)
         validate_goal_not_in_sources(body.from_)
+        plan = project_meta_from_row(get_project_or_404(conn, project_id)).plan
+        if plan.current_stage < len(plan.stages):
+            raise HTTPException(409, "All plan stages must be completed before project completion")
 
         now = utcnow()
         iid = next_intent_id(conn, project_id)
@@ -304,7 +322,9 @@ def complete_project(project_id: str, body: CompleteRequest):
 def reopen_project(project_id: str, body: ReopenRequest):
     with get_conn() as conn:
         expire_reason_leases(conn, project_id)
-        check_project_completed(conn, project_id)
+        project = check_project_completed(conn, project_id)
+        previous_plan = ExecutionPlan.model_validate_json(project["plan"])
+        reopened_plan = ExecutionPlan(stages=previous_plan.stages)
         completion = get_completion_intent_or_409(conn, project_id)
 
         source_rows = conn.execute(
@@ -325,10 +345,7 @@ def reopen_project(project_id: str, body: ReopenRequest):
             "DELETE FROM intents WHERE id = ? AND project_id = ?",
             (completion["id"], project_id),
         )
-        conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            (fact_id, project_id, description),
-        )
+        fact = insert_fact(conn, project_id, fact_id, FactContent(description=description))
         conn.execute(
             "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (intent_id, project_id, fact_id, "external_feedback", creator, creator, now, now, now),
@@ -340,8 +357,8 @@ def reopen_project(project_id: str, body: ReopenRequest):
             )
         clear_project_reason(conn, project_id)
         conn.execute(
-            "UPDATE projects SET status = 'active' WHERE id = ?",
-            (project_id,),
+            "UPDATE projects SET status = 'active', plan = ? WHERE id = ?",
+            (reopened_plan.model_dump_json(), project_id),
         )
 
         updated_project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
@@ -353,6 +370,6 @@ def reopen_project(project_id: str, body: ReopenRequest):
         assert updated_intent is not None
         return ReopenResponse(
             project=project_meta_from_row(updated_project),
-            fact=Fact(id=fact_id, description=description),
+            fact=fact,
             intent=intent_to_model(conn, updated_intent, project_id),
         )

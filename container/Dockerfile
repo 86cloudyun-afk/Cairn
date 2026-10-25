@@ -10,7 +10,7 @@ RUN useradd -m -s /bin/bash kali && \
 USER kali
 
 RUN sudo apt update && \
-    sudo apt install -y bsdextrautils npm jq iputils-ping sshpass ncat rlwrap \
+    sudo apt install -y bsdextrautils npm jq iputils-ping sshpass ncat rlwrap curl python3 ca-certificates \
     bloodyad coercer enum4linux-ng pwncat chisel-common-binaries \
     dirsearch yq krb5-user gitleaks naabu nikto netexec adb && \
     sudo apt clean && \
@@ -87,5 +87,19 @@ COPY ./.agents /home/kali/workspace/.agents
 COPY ./.agents /home/kali/workspace/.claude
 COPY ./AGENTS.md /home/kali/workspace/AGENTS.md
 COPY ./AGENTS.md /home/kali/workspace/CLAUDE.md
+
+COPY ./wrap.py /usr/local/lib/cairn/wrap.py
+COPY ./wrap.sh ./poolcheck.sh /usr/local/bin/
+RUN sudo chmod 0755 /usr/local/bin/wrap.sh /usr/local/bin/poolcheck.sh && \
+    sudo chmod 0644 /usr/local/lib/cairn/wrap.py && \
+    sudo ln -sf /usr/local/bin/wrap.sh /usr/local/bin/curl && \
+    sudo ln -sf /usr/local/bin/wrap.sh /usr/local/bin/wget && \
+    sudo mkdir -p /var/log/wrap /var/lib/wrap && \
+    sudo chown kali:kali /var/log/wrap /var/lib/wrap && \
+    sudo chmod 0750 /var/log/wrap /var/lib/wrap
+ENV PATH="/usr/local/bin:${PATH}"
+ENV WRAP_PROXY=socks5h://127.0.0.1:1080
+ENV WRAP_RATE=0.5
+ENV WRAP_BURST=1
 
 WORKDIR /home/kali/workspace

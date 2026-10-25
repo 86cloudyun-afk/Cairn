@@ -1,0 +1,26 @@
+# Copy the root dispatch.example.yaml and merge these fields into dispatch.yaml.
+# This is a configuration fragment; retain runtime/tasks/workers and credentials
+# from your complete dispatcher config. No dispatcher engine change is required.
+container:
+  image: "ghcr.io/oritera/cairn-worker-container:latest"
+  network_mode: "cairn-tasks"
+  completed_action: "remove"
+  # Do not add extra network capabilities; Docker default capabilities still apply.
+  cap_add: []
+
+# Direct access to explicitly allowlisted targets. The wrapper's built-in default
+# is local SOCKS; override it explicitly because that proxy is not on this bridge.
+common_env:
+  WRAP_PROXY: ""
+
+# Optional proxy: replace common_env above with the block below and add its real
+# PUBLIC IPv4 + TCP port to network.json first.
+# The named proxy must enforce any application/domain restrictions you require.
+# common_env:
+#   WRAP_PROXY: "https://proxy.example.net:443"
+#   HTTPS_PROXY: "https://proxy.example.net:443"
+#   HTTP_PROXY: "https://proxy.example.net:443"
+#   https_proxy: "https://proxy.example.net:443"
+#   http_proxy: "https://proxy.example.net:443"
+#   NO_PROXY: ""
+#   no_proxy: ""

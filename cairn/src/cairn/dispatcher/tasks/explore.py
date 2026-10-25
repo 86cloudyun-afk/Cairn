@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
-from cairn.dispatcher.contracts import parse_json_output, validate_explore_payload
+from cairn.dispatcher.contracts import parse_json_output, validate_explore_result
+from cairn.dispatcher.artifacts import (
+    format_artifacts,
+    saved_session_unavailable,
+    select_session_artifact,
+    write_explore_result,
+)
 from cairn.dispatcher.prompting import load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
@@ -18,11 +25,11 @@ from cairn.dispatcher.tasks.common import (
     preview,
     run_worker_process,
     task_healthcheck_enabled,
-    write_conclude_result,
+    write_artifacts_snapshot_reference,
     write_graph_snapshot_reference,
 )
 from cairn.dispatcher.workers.registry import get_driver
-from cairn.server.models import Intent, ProjectDetail
+from cairn.server.models import Artifact, Intent, ProjectDetail
 
 LOG = logging.getLogger(__name__)
 
@@ -86,6 +93,12 @@ def run_explore_task(
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
+        artifacts_reference = write_artifacts_snapshot_reference(
+            container_manager,
+            container_name,
+            format_artifacts(project.artifacts),
+            phase="explore_execute",
+        )
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore.md"),
             {
@@ -97,23 +110,44 @@ def run_explore_task(
                 ),
                 "intent_id": intent.id,
                 "intent_description": intent.description,
+                "artifacts": artifacts_reference,
+                "artifacts_json": json.dumps(artifacts_reference, ensure_ascii=False),
             },
         )
 
-        session = driver.prepare_session()
-        execute = driver.build_execute(worker, prompt, session)
+        resumable = getattr(driver, "supports_resume", lambda: False)()
+        resumed_artifact = select_session_artifact(project.artifacts, intent, worker) if resumable else None
+        session = resumed_artifact.value["session_id"] if resumed_artifact is not None else None
+        if session:
+            execute = driver.build_resume(worker, prompt, session)
+        else:
+            session = driver.prepare_session()
+            execute = driver.build_execute(worker, prompt, session)
         session = execute.session
         execute_started = time.perf_counter()
-        first = _run_process(
-            container_manager,
-            container_name,
-            worker,
-            execute.argv,
-            phase="explore_execute",
-            timeout=config.tasks.explore.timeout,
-            lease=lease,
-            cancellation=cancellation,
-        )
+        for attempt in range(2):
+            first = _run_process(
+                container_manager,
+                container_name,
+                worker,
+                execute.argv,
+                phase="explore_execute",
+                timeout=config.tasks.explore.timeout,
+                lease=lease,
+                cancellation=cancellation,
+            )
+            if (attempt == 0 and resumed_artifact is not None and lease.failure is None and not did_timeout(first)
+                    and cancel_reason(first, cancellation) is None
+                    and saved_session_unavailable(worker, session, first)):
+                LOG.info(
+                    "saved worker session unavailable; starting a fresh session project=%s intent=%s worker=%s",
+                    project.project.id, intent.id, worker.name,
+                )
+                resumed_artifact = None
+                execute = driver.build_execute(worker, prompt, driver.prepare_session())
+                session = execute.session
+                continue
+            break
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         session = driver.extract_session(session, first.stdout, first.stderr)
         cancelled = cancel_reason(first, cancellation)
@@ -143,7 +177,7 @@ def run_explore_task(
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
-                kind, description = validate_explore_payload(payload)
+                kind, conclusion = validate_explore_result(payload)
             except Exception as exc:
                 LOG.warning(
                     "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -169,6 +203,7 @@ def run_explore_task(
                     session,
                     lease,
                     cancellation,
+                    resumed_artifact=resumed_artifact,
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -182,15 +217,17 @@ def run_explore_task(
                 )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "rejected"
-            return write_conclude_result(
+            return write_explore_result(
                 client,
                 project.project.id,
-                intent.id,
-                worker.name,
-                description,
+                intent,
+                worker,
+                conclusion,
                 source="explore_execute",
                 phase_ms=execute_ms,
                 total_ms=int((time.perf_counter() - task_started) * 1000),
+                session=session if resumable else None,
+                resumed_artifact=resumed_artifact,
             )
         if did_timeout(first):
             LOG.warning(
@@ -216,6 +253,7 @@ def run_explore_task(
                 session,
                 lease,
                 cancellation,
+                resumed_artifact=resumed_artifact,
             )
         LOG.warning(
             "explore command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -251,6 +289,8 @@ def _try_conclude_fallback(
     session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
+    *,
+    resumed_artifact: Artifact | None = None,
 ) -> str:
     if not driver.supports_conclude() or not session:
         LOG.info(
@@ -348,7 +388,7 @@ def _try_conclude_fallback(
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         payload = parse_json_output(model_output)
-        kind, description = validate_explore_payload(payload)
+        kind, conclusion = validate_explore_result(payload)
     except Exception as exc:
         LOG.warning(
             "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -373,14 +413,16 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "rejected"
-    return write_conclude_result(
+    return write_explore_result(
         client,
         project_id,
-        intent.id,
-        worker.name,
-        description,
+        intent,
+        worker,
+        conclusion,
         source="explore_conclude",
         phase_ms=conclude_ms,
+        session=session if getattr(driver, "supports_resume", lambda: False)() else None,
+        resumed_artifact=resumed_artifact,
     )
 
 

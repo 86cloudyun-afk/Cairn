@@ -1,0 +1,10 @@
+{
+  "network_name": "cairn-tasks",
+  "bridge_name": "br-cairn",
+  "subnet": "172.30.0.0/24",
+  "gateway": "172.30.0.1",
+  "dns_servers": ["1.1.1.1", "9.9.9.9"],
+  "https_proxies": [],
+  "host_owned_networks": [],
+  "host_services": []
+}

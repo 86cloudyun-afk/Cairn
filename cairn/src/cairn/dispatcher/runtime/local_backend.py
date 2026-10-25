@@ -55,12 +55,19 @@ class LocalBackend:
             term_grace_seconds=kill_after_seconds,
         )
 
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+    def write_text_file(self, container_name: str, path: str, content: str, *, private: bool = False) -> None:
         target = Path(path)
         if not target.is_absolute():
             raise ValueError(f"local file path must be absolute: {path}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o777)
+        if private:
+            target.parent.chmod(0o700)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(content)
+        else:
+            target.write_text(content, encoding="utf-8")
 
     def needs_completed_cleanup(self, project_id: str) -> bool:
         return self._config.completed_action == "remove" and self._project_dir(project_id).exists()

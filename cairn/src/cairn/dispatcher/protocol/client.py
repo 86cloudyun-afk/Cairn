@@ -107,11 +107,11 @@ class CairnClient:
             json={"worker": worker},
         )
 
-    def conclude(self, project_id: str, intent_id: str, worker: str, description: str) -> ApiResult:
+    def conclude(self, project_id: str, intent_id: str, worker: str, description: str, **fact_fields: Any) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents/{intent_id}/conclude",
-            json={"worker": worker, "description": description},
+            json={"worker": worker, "description": description, **fact_fields},
         )
 
     def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:
@@ -121,12 +121,20 @@ class CairnClient:
             json={"from": from_ids, "description": description, "worker": worker},
         )
 
-    def create_intent(self, project_id: str, from_ids: list[str], description: str, creator: str) -> ApiResult:
+    def create_intent(self, project_id: str, from_ids: list[str], description: str, creator: str, *,
+                      depends_on: list[str] | None = None, priority: int = 0, session_key: str | None = None) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents",
-            json={"from": from_ids, "description": description, "creator": creator, "worker": None},
+            json={"from": from_ids, "description": description, "creator": creator, "worker": None,
+                  "depends_on": depends_on or [], "priority": priority, "session_key": session_key},
         )
+
+    def update_plan(self, project_id: str, plan: dict[str, Any], worker: str) -> ApiResult:
+        return self._request_json("PUT", f"/projects/{project_id}/plan", json={"worker": worker, "plan": plan})
+
+    def create_artifact(self, project_id: str, artifact: dict[str, Any]) -> ApiResult:
+        return self._request_json("POST", f"/projects/{project_id}/artifacts", json=artifact)
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
         try:

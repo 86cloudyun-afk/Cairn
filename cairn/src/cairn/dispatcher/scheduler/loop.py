@@ -55,6 +55,8 @@ class DispatcherLoop:
         self.futures: dict[Future[str], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
+        self._reason_dependency_states: dict[str, tuple[object, ...]] = {}
+        self._pending_reason_dependency_states: dict[str, tuple[object, ...] | None] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
@@ -288,14 +290,13 @@ class DispatcherLoop:
                 return False
             if self._project_requires_bootstrap(project):
                 return self._dispatch_initial_project(project)
-            export_yaml = self.client.export_project(summary.id)
-            return self._dispatch_reason(project, export_yaml, "initial")
         if project.project.reason is None:
             reason_trigger = self._reason_trigger(project)
             if reason_trigger is not None:
                 export_yaml = self.client.export_project(summary.id)
                 return self._dispatch_reason(project, export_yaml, reason_trigger)
         running_intent_ids = self._project_running_explore_intents(summary.id)
+        completed_intent_ids = {intent.id for intent in project.intents if intent.to is not None}
         unclaimed_intents = [
             intent
             for intent in project.intents
@@ -303,6 +304,7 @@ class DispatcherLoop:
             and intent.worker is None
             and intent.id not in running_intent_ids
             and not self._is_bootstrap_intent(intent)
+            and all(dependency in completed_intent_ids for dependency in intent.depends_on)
         ]
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
@@ -313,9 +315,9 @@ class DispatcherLoop:
                 sorted(running_intent_ids),
             )
         if unclaimed_intents:
-            newest = max(unclaimed_intents, key=lambda i: i.created_at)
+            next_intent = min(unclaimed_intents, key=lambda intent: (intent.priority, intent.created_at, intent.id))
             export_yaml = self.client.export_project(summary.id)
-            return self._dispatch_explore(project, export_yaml, newest)
+            return self._dispatch_explore(project, export_yaml, next_intent)
         if project.project.reason is not None:
             self._log_changed(
                 f"{skip_scope}:reason_claimed",
@@ -421,6 +423,9 @@ class DispatcherLoop:
             fact_count=len(project.facts),
             hint_count=len(project.hints),
             open_intent_count=self._project_open_intent_count(project),
+        )
+        self.__dict__.setdefault("_pending_reason_dependency_states", {})[project.project.id] = (
+            self._dependency_blocked_state(project)
         )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
@@ -644,6 +649,20 @@ class DispatcherLoop:
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None)
 
+    def _dependency_blocked_state(self, project: ProjectDetail) -> tuple[object, ...] | None:
+        open_intents = [
+            intent for intent in project.intents if intent.to is None and not self._is_bootstrap_intent(intent)
+        ]
+        if not open_intents or any(intent.worker is not None for intent in open_intents):
+            return None
+        completed_ids = {intent.id for intent in project.intents if intent.to is not None}
+        if any(all(dependency in completed_ids for dependency in intent.depends_on) for intent in open_intents):
+            return None
+        return (
+            tuple(sorted(completed_ids)),
+            tuple(sorted((intent.id, tuple(intent.depends_on)) for intent in open_intents)),
+        )
+
     def _is_bootstrap_intent(self, intent: Intent) -> bool:
         return (
             intent.description == BOOTSTRAP_INTENT_DESCRIPTION
@@ -713,6 +732,9 @@ class DispatcherLoop:
             changes.append(f"hints:{checkpoint.hint_count}->{len(project.hints)}")
         if checkpoint.open_intent_count > 0 and open_intent_count == 0:
             changes.append(f"open_intents:{checkpoint.open_intent_count}->0")
+        blocked_state = self._dependency_blocked_state(project)
+        if blocked_state is not None and getattr(self, "_reason_dependency_states", {}).get(project.project.id) != blocked_state:
+            changes.append("blocked_dependencies")
         if not changes:
             return None
         return ",".join(changes)
@@ -771,6 +793,14 @@ class DispatcherLoop:
                         hint_count=task.hint_count,
                         open_intent_count=task.open_intent_count,
                     )
+                    pending_states = getattr(self, "_pending_reason_dependency_states", {})
+                    if task.project_id in pending_states:
+                        blocked_state = pending_states[task.project_id]
+                        dependency_states = self.__dict__.setdefault("_reason_dependency_states", {})
+                        if blocked_state is None:
+                            dependency_states.pop(task.project_id, None)
+                        else:
+                            dependency_states[task.project_id] = blocked_state
                     LOG.debug(
                         "reason checkpoint updated project=%s facts=%s hints=%s open_intents=%s",
                         task.project_id,
@@ -780,6 +810,9 @@ class DispatcherLoop:
                     )
             except Exception:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
+            finally:
+                if task.task_type == "reason":
+                    getattr(self, "_pending_reason_dependency_states", {}).pop(task.project_id, None)
 
     def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:

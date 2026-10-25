@@ -194,9 +194,19 @@ class ContainerManager:
         argv.extend(command)
         return ManagedProcess(container, argv, env)
 
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
-        archive_path, archive = self._text_file_archive(path, content)
+    def write_text_file(self, container_name: str, path: str, content: str, *, private: bool = False) -> None:
         container = self._require_container(container_name)
+        owner = (0, 0)
+        if private:
+            try:
+                result = container.exec_run(["sh", "-c", "id -u && id -g"])
+                identities = result.output.decode("ascii").splitlines()
+            except (DockerException, UnicodeError, AttributeError) as exc:
+                raise RuntimeError("failed to determine private snapshot owner") from exc
+            if result.exit_code != 0 or len(identities) != 2 or any(not value.isdecimal() for value in identities):
+                raise RuntimeError("failed to determine private snapshot owner")
+            owner = (int(identities[0]), int(identities[1]))
+        archive_path, archive = self._text_file_archive(path, content, private=private, owner=owner)
         try:
             ok = container.put_archive(archive_path, archive)
         except DockerException as exc:
@@ -236,7 +246,9 @@ class ContainerManager:
         return status_code == 409 or "is already in use" in explanation
 
     @staticmethod
-    def _text_file_archive(path: str, content: str) -> tuple[str, bytes]:
+    def _text_file_archive(
+        path: str, content: str, *, private: bool = False, owner: tuple[int, int] = (0, 0),
+    ) -> tuple[str, bytes]:
         target = PurePosixPath(path)
         if not target.is_absolute() or target.name in ("", ".", ".."):
             raise ValueError(f"container file path must be absolute: {path}")
@@ -258,12 +270,14 @@ class ContainerManager:
                 parent = f"{parent}/{part}" if parent else part
                 info = tarfile.TarInfo(parent)
                 info.type = tarfile.DIRTYPE
-                info.mode = 0o755
+                info.mode = 0o700 if private else 0o755
+                info.uid, info.gid = owner
                 archive.addfile(info)
 
             file_name = "/".join(archive_parts)
             info = tarfile.TarInfo(file_name)
             info.size = len(payload)
-            info.mode = 0o644
+            info.mode = 0o600 if private else 0o644
+            info.uid, info.gid = owner
             archive.addfile(info, io.BytesIO(payload))
         return archive_path, stream.getvalue()

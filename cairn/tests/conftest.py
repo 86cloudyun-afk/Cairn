@@ -104,7 +104,7 @@ class FakeContainerManager:
     def ensure_running(self, project_id: str) -> str:
         return f"container-{project_id}"
 
-    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+    def write_text_file(self, container_name: str, path: str, content: str, *, private: bool = False) -> None:
         self.writes.append((container_name, path, content))
 
 
@@ -116,11 +116,12 @@ class FakeClient:
     created_intents: list[tuple[str, list[str], str, str]] = field(default_factory=list)
     released: list[tuple[str, str, str]] = field(default_factory=list)
     released_reasons: list[tuple[str, str]] = field(default_factory=list)
+    artifacts_saved: list[tuple[str, dict]] = field(default_factory=list)
 
     def get_project(self, _project_id: str) -> ProjectDetail:
         return self.project
 
-    def conclude(self, project_id: str, intent_id: str, worker: str, description: str) -> ApiResult:
+    def conclude(self, project_id: str, intent_id: str, worker: str, description: str, **_fields) -> ApiResult:
         self.concluded.append((project_id, intent_id, worker, description))
         return ApiResult(200, {"fact": {"id": "f002"}})
 
@@ -139,6 +140,10 @@ class FakeClient:
     def release_reason(self, project_id: str, worker: str) -> ApiResult:
         self.released_reasons.append((project_id, worker))
         return ApiResult(200, {})
+
+    def create_artifact(self, project_id: str, artifact: dict) -> ApiResult:
+        self.artifacts_saved.append((project_id, artifact))
+        return ApiResult(201, {"id": f"a{len(self.artifacts_saved):03d}", **artifact})
 
     def heartbeat(self, _project_id: str, _intent_id: str, _worker: str) -> ApiResult:
         return ApiResult(200, {})

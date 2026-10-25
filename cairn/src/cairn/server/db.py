@@ -26,13 +26,20 @@ CREATE TABLE IF NOT EXISTS projects (
     reason_worker TEXT,
     reason_trigger TEXT,
     reason_started_at TEXT,
-    reason_last_heartbeat_at TEXT
+    reason_last_heartbeat_at TEXT,
+    plan TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     description TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'other',
+    summary TEXT NOT NULL DEFAULT '',
+    ip TEXT,
+    port INTEGER,
+    url TEXT,
+    confidence INTEGER,
     PRIMARY KEY (id, project_id)
 );
 
@@ -46,6 +53,9 @@ CREATE TABLE IF NOT EXISTS intents (
     last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     concluded_at TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    priority INTEGER NOT NULL DEFAULT 0,
+    session_key TEXT,
     PRIMARY KEY (id, project_id)
 );
 
@@ -64,6 +74,20 @@ CREATE TABLE IF NOT EXISTS hints (
     creator TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    fact_id TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value TEXT,
+    file_path TEXT,
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, project_id),
+    FOREIGN KEY (fact_id, project_id) REFERENCES facts(id, project_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS counters (
@@ -91,6 +115,8 @@ def configure(path: Path) -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _ensure_project_columns(conn)
+        _ensure_fact_columns(conn)
+        _ensure_intent_columns(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:
@@ -101,6 +127,47 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE projects SET bootstrap_enabled = CASE WHEN bootstrap_mode = 'disabled' THEN 0 ELSE 1 END"
             )
+    if "plan" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN plan TEXT NOT NULL DEFAULT '{}'")
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, definitions: dict[str, str]) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in definitions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _ensure_fact_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "facts",
+        {
+            "kind": "TEXT NOT NULL DEFAULT 'other'",
+            "summary": "TEXT NOT NULL DEFAULT ''",
+            "ip": "TEXT",
+            "port": "INTEGER",
+            "url": "TEXT",
+            "confidence": "INTEGER",
+        },
+    )
+    rows = conn.execute("SELECT id, project_id, description FROM facts WHERE summary = ''").fetchall()
+    conn.executemany(
+        "UPDATE facts SET summary = ? WHERE id = ? AND project_id = ?",
+        [(" ".join(row["description"].split())[:120], row["id"], row["project_id"]) for row in rows],
+    )
+
+
+def _ensure_intent_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "intents",
+        {
+            "depends_on": "TEXT NOT NULL DEFAULT '[]'",
+            "priority": "INTEGER NOT NULL DEFAULT 0",
+            "session_key": "TEXT",
+        },
+    )
 
 
 @contextmanager

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from cairn.server.models import Intent, ProjectMeta, ProjectReason
+from cairn.server.models import Artifact, ExecutionPlan, Fact, FactContent, Intent, ProjectMeta, ProjectReason
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -46,6 +47,29 @@ def next_intent_id(conn: sqlite3.Connection, project_id: str) -> str:
 
 def next_hint_id(conn: sqlite3.Connection, project_id: str) -> str:
     return _next_scoped_id(conn, "hint", "h", project_id)
+
+
+def next_artifact_id(conn: sqlite3.Connection, project_id: str) -> str:
+    return _next_scoped_id(conn, "artifact", "a", project_id)
+
+
+def insert_fact(conn: sqlite3.Connection, project_id: str, fact_id: str, content: FactContent) -> Fact:
+    fact = Fact(id=fact_id, **content.model_dump())
+    conn.execute(
+        "INSERT INTO facts (id, project_id, description, kind, summary, ip, port, url, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fact.id, project_id, fact.description, fact.kind, fact.summary, fact.ip, fact.port, fact.url, fact.confidence),
+    )
+    return fact
+
+
+def build_artifacts(conn: sqlite3.Connection, project_id: str, *, include_expired: bool = False) -> list[Artifact]:
+    query = "SELECT * FROM artifacts WHERE project_id = ?"
+    params: tuple = (project_id,)
+    if not include_expired:
+        query += " AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))"
+        params += (datetime.now(timezone.utc).isoformat(),)
+    rows = conn.execute(query + " ORDER BY created_at, rowid", params).fetchall()
+    return [Artifact(**{**dict(row), "value": json.loads(row["value"]) if row["value"] is not None else None}) for row in rows]
 
 
 def get_project_or_404(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row:
@@ -118,7 +142,24 @@ def get_claimable_open_intent_or_404(
         raise HTTPException(409, "Intent already concluded")
     if row["worker"] is not None and row["worker"] != worker:
         raise HTTPException(409, f"Intent is currently claimed by {row['worker']}")
+    validate_intent_dependencies(conn, project_id, json.loads(row["depends_on"]), require_completed=True)
     return row
+
+
+def validate_intent_dependencies(
+    conn: sqlite3.Connection,
+    project_id: str,
+    dependency_ids: list[str],
+    *,
+    intent_id: str | None = None,
+    require_completed: bool = False,
+) -> None:
+    for dependency_id in dependency_ids:
+        if dependency_id == intent_id:
+            raise HTTPException(400, "Intent cannot depend on itself")
+        row = get_intent_or_404(conn, project_id, dependency_id)
+        if require_completed and row["to_fact_id"] is None:
+            raise HTTPException(409, f"Dependency {dependency_id} is not concluded")
 
 
 def get_releasable_open_intent_or_404(
@@ -162,6 +203,9 @@ def intent_to_model(conn: sqlite3.Connection, row: sqlite3.Row, project_id: str)
         last_heartbeat_at=row["last_heartbeat_at"],
         created_at=row["created_at"],
         concluded_at=row["concluded_at"],
+        depends_on=json.loads(row["depends_on"]),
+        priority=row["priority"],
+        session_key=row["session_key"],
     )
 
 
@@ -202,6 +246,7 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         bootstrap_enabled=bool(row["bootstrap_enabled"]),
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
+        plan=ExecutionPlan.model_validate_json(row["plan"]),
     )
 
 
