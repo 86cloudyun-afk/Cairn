@@ -4,10 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+import re
 from typing import Any
 
 from cairn.dispatcher.config import WorkerConfig
 from cairn.dispatcher.protocol.client import CairnClient
+from cairn.dispatcher.runtime.process import ProcessResult
 from cairn.dispatcher.tasks.common import best_effort_release, write_conclude_result_with_fact_id
 from cairn.server.models import Artifact, Intent
 
@@ -54,6 +56,19 @@ def select_session_artifact(artifacts: list[Artifact], intent: Intent, worker: W
 def select_session(artifacts: list[Artifact], intent: Intent, worker: WorkerConfig) -> str | None:
     artifact = select_session_artifact(artifacts, intent, worker)
     return artifact.value["session_id"] if artifact is not None else None
+
+
+def saved_session_unavailable(worker: WorkerConfig, session: str | None, result: ProcessResult) -> bool:
+    """Recognize an explicit missing conversation, never a generic worker failure."""
+    if not session or result.returncode == 0 or result.timed_out or result.cancelled:
+        return False
+    if worker.type == "claudecode":
+        return re.search(
+            r"No conversation found with session ID:\s*" + re.escape(session) + r"(?=$|[\s'\".])",
+            result.stderr,
+            flags=re.IGNORECASE,
+        ) is not None
+    return False
 
 
 def write_explore_result(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from cairn.dispatcher.workers.adapters.codex import CodexDriver
 from cairn.dispatcher.workers.adapters.pi import PiDriver
 from cairn.dispatcher.workers.registry import get_driver
 
-from conftest import FakeClient, make_config, make_intent, make_project
+from conftest import FakeClient, FakeLease, make_config, make_intent, make_project
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -460,3 +461,154 @@ def test_explore_local_cli_rejection_releases_intent(tmp_path: Path, monkeypatch
     assert outcome == "rejected"
     assert client.concluded == []
     assert client.released == [("proj_001", "i001", "test-worker")]
+
+
+def test_missing_saved_session_recovers_after_workspace_removal_and_next_task_resumes(tmp_path: Path, monkeypatch) -> None:
+    from cairn.server.models import Artifact
+
+    _install_fake_cli(tmp_path, monkeypatch, "claude", """
+if [ "$1" = "-r" ]; then
+    if [ ! -f ".sessions/$2" ]; then
+        printf 'missing %s\\n' "$2" >> invocations.log
+        printf 'No conversation found with session ID: %s\\n' "$2" >&2
+        exit 1
+    fi
+    printf 'resume %s\\n' "$2" >> invocations.log
+else
+    mkdir -p .sessions
+    touch ".sessions/$2"
+    printf 'fresh %s\\n' "$2" >> invocations.log
+fi
+echo '{"description":"confirmed after reopen"}'
+""")
+    monkeypatch.setattr(common, "GRAPH_SNAPSHOT_ROOT", str(tmp_path / "prompts"))
+    monkeypatch.setattr(explore.HeartbeatLease, "for_intent", lambda *_a: FakeLease())
+    config = _local_config_for_worker("test-worker", "claudecode")
+    backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path / "work"), completed_action="remove"))
+    intent = make_intent()
+    project = make_project(intents=[intent])
+    project.artifacts = [Artifact(
+        id="a001", project_id=project.project.id, name=intent.description, kind="session",
+        value={"session_id": "old-session", "topic": intent.description, "worker": "test-worker", "backend": "claudecode"},
+        created_at="2026-01-01T00:00:00Z",
+    )]
+    handle = Path(backend.ensure_running(project.project.id))
+    (handle / ".sessions").mkdir()
+    (handle / ".sessions" / "old-session").touch()
+    assert backend.cleanup_completed(project.project.id)
+    assert not handle.exists()
+    client = FakeClient(project)
+
+    outcome = explore.run_explore_task(
+        config, client, backend, project, "facts: []", intent, config.workers[0], TaskCancellation(),
+    )
+
+    assert outcome == "success"
+    saved = client.artifacts_saved[-1][1]
+    replacement_id = saved["value"]["session_id"]
+    assert replacement_id != "old-session"
+    assert (handle / ".sessions" / replacement_id).is_file()
+    project.artifacts.append(Artifact(
+        id="a002", project_id=project.project.id, created_at=datetime.now(timezone.utc), **saved,
+    ))
+    next_intent = make_intent("i002")
+    next_outcome = explore.run_explore_task(
+        config, client, backend, project, "facts: []", next_intent, config.workers[0], TaskCancellation(),
+    )
+    assert next_outcome == "success"
+    assert (handle / "invocations.log").read_text().splitlines() == [
+        "missing old-session", f"fresh {replacement_id}", f"resume {replacement_id}",
+    ]
+    assert len(client.concluded) == 2
+
+
+def test_resume_authentication_failure_does_not_start_a_fresh_session(tmp_path: Path, monkeypatch) -> None:
+    from cairn.server.models import Artifact
+
+    _install_fake_cli(tmp_path, monkeypatch, "claude", """
+if [ "$1" = "-r" ]; then
+    echo 'Authentication failed: invalid API key' >&2
+    exit 1
+fi
+touch unexpected-fresh-session
+echo '{"description":"must not run"}'
+""")
+    monkeypatch.setattr(common, "GRAPH_SNAPSHOT_ROOT", str(tmp_path / "prompts"))
+    monkeypatch.setattr(explore.HeartbeatLease, "for_intent", lambda *_a: FakeLease())
+    config = _local_config_for_worker("test-worker", "claudecode")
+    backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path / "work")))
+    intent = make_intent()
+    project = make_project(intents=[intent])
+    project.artifacts = [Artifact(
+        id="a001", project_id=project.project.id, name=intent.description, kind="session",
+        value={"session_id": "old-session", "topic": intent.description, "worker": "test-worker", "backend": "claudecode"},
+        created_at="2026-01-01T00:00:00Z",
+    )]
+    client = FakeClient(project)
+    outcome = explore.run_explore_task(
+        config, client, backend, project, "facts: []", intent, config.workers[0], TaskCancellation(),
+    )
+    assert outcome == "failed"
+    assert not (Path(backend.container_name(project.project.id)) / "unexpected-fresh-session").exists()
+    assert client.concluded == []
+
+
+@pytest.mark.parametrize("inventory_case", ["large-value", "many-sessions"])
+def test_large_artifact_inventory_launches_real_worker_with_private_snapshot(tmp_path: Path, monkeypatch, inventory_case) -> None:
+    from cairn.server.models import Artifact
+
+    expected_count = 1 if inventory_case == "large-value" else 400
+    _install_fake_cli(tmp_path, monkeypatch, "claude", f"""
+python3 - "$@" <<'PYWORKER'
+import json
+import re
+import stat
+import sys
+from pathlib import Path
+
+prompt = sys.argv[-1]
+path = Path(re.search(r"(?m)^(/[^\\n]+/artifacts\\.json)$", prompt).group(1))
+inventory = json.loads(path.read_text())
+assert len(inventory) == {expected_count}
+assert all(entry["name"] != "expired-secret" for entry in inventory)
+assert stat.S_IMODE(path.stat().st_mode) == 0o600
+assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+if {inventory_case!r} == "large-value":
+    assert inventory[0]["value"] == "x" * 140000
+else:
+    assert inventory[0]["value"]["session_id"] == "historical-session-0"
+    assert inventory[-1]["value"]["session_id"] == "historical-session-399"
+assert len(prompt.encode()) < 16000
+print(json.dumps({{"description": "read full artifact inventory"}}))
+PYWORKER
+""")
+    monkeypatch.setattr(common, "GRAPH_SNAPSHOT_ROOT", str(tmp_path / "prompts"))
+    monkeypatch.setattr(explore.HeartbeatLease, "for_intent", lambda *_a: FakeLease())
+    config = _local_config_for_worker("test-worker", "claudecode")
+    backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path / "work")))
+    intent = make_intent()
+    project = make_project(intents=[intent])
+    if inventory_case == "large-value":
+        project.artifacts = [Artifact(
+            id="a001", project_id=project.project.id, kind="token", name="large valid value", value="x" * 140000,
+            created_at="2026-01-01T00:00:00Z",
+        )]
+    else:
+        project.artifacts = [Artifact(
+            id=f"a{index:03d}", project_id=project.project.id, kind="session", name="historical task session",
+            value={"session_id": f"historical-session-{index}", "topic": "historical task session",
+                   "worker": "test-worker", "backend": "claudecode"},
+            created_at="2026-01-01T00:00:00Z",
+        ) for index in range(400)]
+    project.artifacts.append(Artifact(
+        id="expired", project_id=project.project.id, kind="token", name="expired-secret", value="must not reach worker",
+        expires_at="2000-01-01T00:00:00Z", created_at="2000-01-01T00:00:00Z",
+    ))
+    client = FakeClient(project)
+
+    outcome = explore.run_explore_task(
+        config, client, backend, project, "facts: []", intent, config.workers[0], TaskCancellation(),
+    )
+
+    assert outcome == "success"
+    assert client.concluded == [("proj_001", "i001", "test-worker", "read full artifact inventory")]

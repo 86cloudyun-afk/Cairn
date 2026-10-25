@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import parse_json_output, validate_explore_result
-from cairn.dispatcher.artifacts import format_artifacts, select_session_artifact, write_explore_result
+from cairn.dispatcher.artifacts import (
+    format_artifacts,
+    saved_session_unavailable,
+    select_session_artifact,
+    write_explore_result,
+)
 from cairn.dispatcher.prompting import load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
@@ -19,6 +25,7 @@ from cairn.dispatcher.tasks.common import (
     preview,
     run_worker_process,
     task_healthcheck_enabled,
+    write_artifacts_snapshot_reference,
     write_graph_snapshot_reference,
 )
 from cairn.dispatcher.workers.registry import get_driver
@@ -86,6 +93,12 @@ def run_explore_task(
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
+        artifacts_reference = write_artifacts_snapshot_reference(
+            container_manager,
+            container_name,
+            format_artifacts(project.artifacts),
+            phase="explore_execute",
+        )
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore.md"),
             {
@@ -97,7 +110,8 @@ def run_explore_task(
                 ),
                 "intent_id": intent.id,
                 "intent_description": intent.description,
-                "artifacts": format_artifacts(project.artifacts),
+                "artifacts": artifacts_reference,
+                "artifacts_json": json.dumps(artifacts_reference, ensure_ascii=False),
             },
         )
 
@@ -111,16 +125,29 @@ def run_explore_task(
             execute = driver.build_execute(worker, prompt, session)
         session = execute.session
         execute_started = time.perf_counter()
-        first = _run_process(
-            container_manager,
-            container_name,
-            worker,
-            execute.argv,
-            phase="explore_execute",
-            timeout=config.tasks.explore.timeout,
-            lease=lease,
-            cancellation=cancellation,
-        )
+        for attempt in range(2):
+            first = _run_process(
+                container_manager,
+                container_name,
+                worker,
+                execute.argv,
+                phase="explore_execute",
+                timeout=config.tasks.explore.timeout,
+                lease=lease,
+                cancellation=cancellation,
+            )
+            if (attempt == 0 and resumed_artifact is not None and lease.failure is None and not did_timeout(first)
+                    and cancel_reason(first, cancellation) is None
+                    and saved_session_unavailable(worker, session, first)):
+                LOG.info(
+                    "saved worker session unavailable; starting a fresh session project=%s intent=%s worker=%s",
+                    project.project.id, intent.id, worker.name,
+                )
+                resumed_artifact = None
+                execute = driver.build_execute(worker, prompt, driver.prepare_session())
+                session = execute.session
+                continue
+            break
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         session = driver.extract_session(session, first.stdout, first.stderr)
         cancelled = cancel_reason(first, cancellation)
