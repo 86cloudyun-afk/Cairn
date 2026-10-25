@@ -16,6 +16,12 @@ Normal return example:
 {"accepted": true, "data": {"description": "..."}}
 ```
 
+Optional structured return (legacy `description` remains valid):
+```json
+{"accepted":true,"data":{"fact":{"description":"Full confirmed result","kind":"finding","summary":"One-line result","confidence":95},"artifacts":[{"kind":"token","name":"access token","value":"confirmed token","expires_at":"2030-01-01T00:00:00Z"},{"kind":"file","name":"reusable script","file_path":"/workspace/script.py"}]}}
+```
+Fact optional fields: kind (finding/credential/endpoint/negative/other), summary, ip, port, url, confidence (integer 0–100). Artifact fields: kind (account/session/token/file/endpoint), name, value (JSON), file_path, expires_at (timezone required). File artifacts need file_path. Omit fact_id; the dispatcher links the newly concluded fact. Include only already confirmed reusable artifacts. Real worker sessions are saved automatically.
+
 # Rules
 - Stop immediately and produce the JSON now. Do not continue the task.
 - Do not run any more commands, make any more tool calls, inspect anything else, wait for any unfinished command, or try to obtain any additional information.

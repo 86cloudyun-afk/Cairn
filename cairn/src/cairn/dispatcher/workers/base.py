@@ -31,6 +31,12 @@ class WorkerDriver(abc.ABC):
     def prepare_session(self) -> str | None:
         return None
 
+    def supports_resume(self) -> bool:
+        return True
+
+    def build_resume(self, worker: WorkerConfig, prompt: str, session: str) -> DriverResult:
+        return DriverResult(self.build_conclude(worker, prompt, session), session=session)
+
     @abc.abstractmethod
     def check_health(self, worker: WorkerConfig, *, timeout: float) -> HealthResult:
         """Verify this worker's LLM config is usable, in-process (no container, no curl)."""

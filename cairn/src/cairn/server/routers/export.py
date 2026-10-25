@@ -4,7 +4,8 @@ from datetime import datetime
 import yaml
 
 from cairn.server.db import get_conn
-from cairn.server.services import expire_reason_leases, expire_workers, get_project_or_404
+from cairn.server.models import Fact
+from cairn.server.services import expire_reason_leases, expire_workers, get_project_or_404, intent_to_model, project_meta_from_row
 
 router = APIRouter(tags=["export"])
 
@@ -25,7 +26,7 @@ def _load_project_data(conn, project_id: str):
     proj = get_project_or_404(conn, project_id)
 
     facts = conn.execute(
-        "SELECT id, description FROM facts WHERE project_id = ?", (project_id,)
+        "SELECT * FROM facts WHERE project_id = ?", (project_id,)
     ).fetchall()
     hints = conn.execute(
         "SELECT content, creator, created_at FROM hints WHERE project_id = ? ORDER BY created_at",
@@ -64,6 +65,7 @@ def _export_yaml(conn, project_id: str) -> str:
             "origin": origin_desc,
             "goal": goal_desc,
             "bootstrap_enabled": bool(proj["bootstrap_enabled"]),
+            "plan": project_meta_from_row(proj).plan.model_dump(),
         }
     }
 
@@ -77,11 +79,12 @@ def _export_yaml(conn, project_id: str) -> str:
             for h in hints
         ]
 
-    data["facts"] = [{"id": f["id"], "description": f["description"]} for f in facts]
+    data["facts"] = [Fact(**dict(f)).model_dump() for f in facts]
 
     intent_list = []
     for i in intents:
         entry: dict = {
+            "id": i["id"],
             "from": sources_by_intent.get(i["id"], []),
             "to": i["to_fact_id"],
             "description": i["description"],
@@ -89,6 +92,9 @@ def _export_yaml(conn, project_id: str) -> str:
             "worker": i["worker"],
             "created_at": format_export_timestamp(i["created_at"]),
             "concluded_at": format_export_timestamp(i["concluded_at"]),
+            "depends_on": intent_to_model(conn, i, project_id).depends_on,
+            "priority": i["priority"],
+            "session_key": i["session_key"],
         }
         intent_list.append(entry)
 
